@@ -1,0 +1,90 @@
+name: Build MicVST Low Latency
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - name: Check out MicVST source
+        uses: actions/checkout@v4
+
+      - name: Apply low-buffer patch
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          audio_file = Path('src/audio/AudioEngine.cpp')
+          audio = audio_file.read_text(encoding='utf-8')
+          anchor = '    const juce::String err = deviceManager.setAudioDeviceSetup (setup, true);\n'
+          assert audio.count(anchor) == 1, 'AudioEngine.cpp changed; patch needs updating'
+          insertion = '''    // Request the smallest buffer size exposed by the shared-mode device pair.
+              if (err.isEmpty())
+              {
+                  if (auto* active = deviceManager.getCurrentAudioDevice())
+                  {
+                      const auto sizes = active->getAvailableBufferSizes();
+                      int smallest = 0;
+                      juce::StringArray offered;
+                      for (const int frames : sizes)
+                      {
+                          offered.add (juce::String (frames));
+                          if (frames > 0 && (smallest == 0 || frames < smallest))
+                              smallest = frames;
+                      }
+                      juce::Logger::writeToLog (
+                          "Supported WASAPI buffers: " + offered.joinIntoString (", ")
+                          + " | current: " + juce::String (active->getCurrentBufferSizeSamples()));
+                      if (smallest > 0 && smallest < active->getCurrentBufferSizeSamples())
+                      {
+                          auto lowSetup = deviceManager.getAudioDeviceSetup();
+                          lowSetup.bufferSize = smallest;
+                          const auto lowErr = deviceManager.setAudioDeviceSetup (lowSetup, true);
+                          if (lowErr.isNotEmpty())
+                          {
+                              juce::Logger::writeToLog ("Smallest buffer request failed: " + lowErr);
+                              deviceManager.setAudioDeviceSetup (setup, true);
+                          }
+                      }
+                  }
+              }
+          '''
+          audio = audio.replace(anchor, anchor + insertion, 1)
+          audio_file.write_text(audio, encoding='utf-8')
+
+          ui_file = Path('src/ui/DevicePanel.cpp')
+          ui = ui_file.read_text(encoding='utf-8')
+          anchor = '        st << "   |   buffer " << juce::String (buf);\n'
+          assert ui.count(anchor) == 1, 'DevicePanel.cpp changed; patch needs updating'
+          insertion = '''        // Display smallest buffer exposed by the current Windows audio device.
+                  const auto supported = dev->getAvailableBufferSizes();
+                  if (! supported.isEmpty())
+                  {
+                      int smallest = supported[0];
+                      for (const int frames : supported)
+                          smallest = juce::jmin (smallest, frames);
+                      st << "   |   min " << juce::String (smallest);
+                  }
+          '''
+          ui = ui.replace(anchor, anchor + insertion, 1)
+          ui_file.write_text(ui, encoding='utf-8')
+          print('MicVST low-buffer modification applied successfully.')
+          PY
+
+      - name: Configure CMake (JUCE downloads automatically)
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Compile portable EXE
+        run: cmake --build build --config Release --target MicVST --parallel 2
+
+      - name: Upload portable EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: MicVST-Low-Latency-Windows-x64
+          path: build/MicVST_artefacts/Release/MicVST.exe
+          if-no-files-found: error
